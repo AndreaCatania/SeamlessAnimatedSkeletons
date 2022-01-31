@@ -18,7 +18,8 @@ public class AnimationExtractor : ModuleRules
 				"Engine",
 				"Slate",
 				"SlateCore",
-				"SeamlessAnimatedSkeletons"
+				"SeamlessAnimatedSkeletons",
+				"NiagaraAnimNotifies"
 			}
 		);
 	}

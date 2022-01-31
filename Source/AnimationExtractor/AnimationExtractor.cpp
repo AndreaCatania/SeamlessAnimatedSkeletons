@@ -1,4 +1,5 @@
 #include "AnimationExtractor.h"
+
 #include "AnimationExtractorStyle.h"
 #include "AnimationExtractorCommands.h"
 #include "EditorAnimUtils.h"
@@ -14,6 +15,9 @@
 #include "AssetToolsModule.h"
 #include "SeamlessAnimationAction.h"
 #include "SeamlessAnimatedSkeletons/SeamlessAnimationData.h"
+#include "PostRetargetActionBase.h"
+#include "Animation/AnimBlueprintGeneratedClass.h"
+#include "EdGraph/EdGraph.h"
 
 DEFINE_LOG_CATEGORY(AnimationExtractor);
 
@@ -81,6 +85,75 @@ void FAnimationExtractorModule::StartRetarget()
 	FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("Retargeting done.")));
 }
 
+// Copied from EditorAnimUtils.cpp, since not exposed :/
+namespace CopiedEditorAnimUtils
+{
+/** Helper archive class to find all references, used by the cycle finder **/
+class FFindAnimAssetRefs : public FArchiveUObject
+{
+public:
+	/**
+	* Constructor
+	*
+	* @param	Src		the object to serialize which may contain a references
+	*/
+	FFindAnimAssetRefs(UObject* Src, TArray<UAnimationAsset*>& OutAnimationAssets)
+		: AnimationAssets(OutAnimationAssets)
+	{
+		// use the optimized RefLink to skip over properties which don't contain object references
+		ArIsObjectReferenceCollector = true;
+
+		ArIgnoreArchetypeRef = false;
+		ArIgnoreOuterRef = true;
+		ArIgnoreClassRef = false;
+
+		Src->Serialize(*this);
+	}
+
+	virtual FString GetArchiveName() const
+	{
+		return TEXT("FFindAnimAssetRefs");
+	}
+
+private:
+	/** Serialize a reference **/
+	FArchive& operator<<(class UObject*& Obj)
+	{
+		if (UAnimationAsset* Anim = Cast<UAnimationAsset>(Obj))
+		{
+			AnimationAssets.AddUnique(Anim);
+		}
+		return *this;
+	}
+
+	TArray<UAnimationAsset*>& AnimationAssets;
+};
+
+void GetAllAnimationSequencesReferredInBlueprint(UAnimBlueprint* AnimBlueprint, TArray<UAnimationAsset*>& AnimationAssets)
+{
+	UObject* DefaultObject = AnimBlueprint->GetAnimBlueprintGeneratedClass()->GetDefaultObject();
+	FFindAnimAssetRefs AnimRefFinderObject(DefaultObject, AnimationAssets);
+
+	// For assets referenced in the event graph (either pin default values or variable-get nodes)
+	// we need to serialize the nodes in that graph
+	for (UEdGraph* GraphPage : AnimBlueprint->UbergraphPages)
+	{
+		for (UEdGraphNode* Node : GraphPage->Nodes)
+		{
+			FFindAnimAssetRefs AnimRefFinderBlueprint(Node, AnimationAssets);
+		}
+	}
+
+	// Gather references in functions
+	for (UEdGraph* GraphPage : AnimBlueprint->FunctionGraphs)
+	{
+		for (UEdGraphNode* Node : GraphPage->Nodes)
+		{
+			FFindAnimAssetRefs AnimRefFinderBlueprint(Node, AnimationAssets);
+		}
+	}
+}
+}
 
 void FAnimationExtractorModule::Retarget(const FString& FolderPath, USeamlessAnimationData* SeamlessAnimation, FAssetRegistryModule& AssetRegistryModule)
 {
@@ -158,6 +231,9 @@ void FAnimationExtractorModule::Retarget(const FString& FolderPath, USeamlessAni
 	ProgressBarDialog.Initialize();
 	ProgressBarDialog.MakeDialog();
 
+	// Original Asset: Retargeted Asset
+	TMap<UAnimationAsset*, UAnimationAsset*> RetargetedAnimAssets;
+
 	for (auto Asset : AssetsToRetargetData)
 	{
 		if (ProgressBarDialog.ShouldCancel())
@@ -176,13 +252,58 @@ void FAnimationExtractorModule::Retarget(const FString& FolderPath, USeamlessAni
 		EditorAnimUtils::FNameDuplicationRule NameRule;
 		NameRule.Prefix = Prefix;
 		NameRule.FolderPath = FolderPath;
+
+		const bool bRetargetReferredAssets = true;
+		const bool bConvertSpace = true;
+
+		EditorAnimUtils::FAnimationRetargetContext RetargetContext(RetargetAssets, bRetargetReferredAssets, bConvertSpace);
+
+		// Add the already retargeted assets, to avoid duplicates.
+		for (const TPair<UAnimationAsset*, UAnimationAsset*>& E : RetargetedAnimAssets)
+		{
+			RetargetContext.AddRemappedAsset(E.Key, E.Value);
+		}
+
 		EditorAnimUtils::RetargetAnimations(
 			SourceSkeleton,
 			TargetSkeleton,
-			RetargetAssets,
-			true,
-			&NameRule,
-			true);
+			RetargetContext,
+			bRetargetReferredAssets,
+			&NameRule);
+
+		TArray<UObject*> SourceAssetsToRetarget;
+
+		// Fetch all the sub animations used by this BP anim.
+		if (Asset.GetAsset()->IsA<UAnimBlueprint>())
+		{
+			TArray<UAnimationAsset*> ReferredAnimations;
+			CopiedEditorAnimUtils::GetAllAnimationSequencesReferredInBlueprint(static_cast<UAnimBlueprint*>(Asset.GetAsset()), ReferredAnimations);
+			SourceAssetsToRetarget.Append(ReferredAnimations);
+		}
+
+		// Put the original asset
+		SourceAssetsToRetarget.AddUnique(Asset.GetAsset());
+
+		// Fetch the Retargeted assets to execute the post actions.
+		TArray<UObject*> RetargetedObjects;
+		for (UObject* SourceAsset : SourceAssetsToRetarget)
+		{
+			UObject* Retargeted = RetargetContext.GetDuplicate(SourceAsset);
+			if (Retargeted != nullptr)
+			{
+				// Post action.
+				ExecutePostRetargetActions(SourceSkeleton, SourceAsset, TargetSkeleton, Retargeted);
+
+				// Store the assets inside the map so those are not retargeted again.
+				if (SourceAsset->IsA<UAnimationAsset>())
+				{
+					checkf(Retargeted->IsA<UAnimationAsset>(), TEXT("An UAnimationAsset can't be retargeted to something else."));
+					RetargetedAnimAssets.Add(
+						static_cast<UAnimationAsset*>(SourceAsset),
+						static_cast<UAnimationAsset*>(Retargeted));
+				}
+			}
+		}
 	}
 
 	ProgressBarDialog.Destroy();
@@ -225,6 +346,41 @@ void FAnimationExtractorModule::UpdateAnimationData(USeamlessAnimationData* Seam
 					SeamlessAnimation->AnimationsMap.Emplace(
 						static_cast<const UAnimSequenceBase*>(Asset.GetAsset()),
 						static_cast<UAnimSequenceBase*>(TargetAsset->GetAsset()));
+				}
+			}
+		}
+	}
+}
+
+void FAnimationExtractorModule::RegisterMenus()
+{
+	// Owner will be used for cleanup in call to UToolMenus::UnregisterOwner
+	FToolMenuOwnerScoped OwnerScoped(this);
+
+	{
+		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Window");
+		{
+			FToolMenuSection& Section = Menu->FindOrAddSection("WindowLayout");
+			Section.AddMenuEntryWithCommandList(FAnimationExtractorCommands::Get().RetargetMissingAction, PluginCommands);
+		}
+	}
+
+	{
+		UToolMenu* ToolbarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar");
+		{
+			FToolMenuSection& Section = ToolbarMenu->FindOrAddSection("Settings");
+			{
+				{
+					FToolMenuEntry& Entry = Section.AddEntry(FToolMenuEntry::InitToolBarButton(
+						FAnimationExtractorCommands::Get().RetargetMissingAction,
+						TAttribute<FText>(),
+						TAttribute<FText>(),
+						FSlateIcon(
+							FAnimationExtractorStyle::GetStyleSetName(),
+							FName(TEXT("AnimationExtractor.Retarget")),
+							FName(TEXT("AnimationExtractor.Retarget.Small")))
+						));
+					Entry.SetCommandList(PluginCommands);
 				}
 			}
 		}
@@ -274,41 +430,29 @@ FString FAnimationExtractorModule::GetAnimResourceName(const FAssetData& Asset)
 	return FString();
 }
 
-void FAnimationExtractorModule::RegisterMenus()
+// Retarget the Notifies
+void FAnimationExtractorModule::ExecutePostRetargetActions(USkeleton* SourceSkeleton, UObject* SourceAsset, USkeleton* TargetSkeleton, UObject* RetargetedAsset)
 {
-	// Owner will be used for cleanup in call to UToolMenus::UnregisterOwner
-	FToolMenuOwnerScoped OwnerScoped(this);
-
+	if (PostRetargetActionsLoaded == false)
 	{
-		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Window");
+		// Fetch all the `UClasses` that derives from `UPostRetargetActionBase`.
+		for (TObjectIterator<UClass> It; It; ++It)
 		{
-			FToolMenuSection& Section = Menu->FindOrAddSection("WindowLayout");
-			Section.AddMenuEntryWithCommandList(FAnimationExtractorCommands::Get().RetargetMissingAction, PluginCommands);
-		}
-	}
-
-	{
-		UToolMenu* ToolbarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar");
-		{
-			FToolMenuSection& Section = ToolbarMenu->FindOrAddSection("Settings");
+			if (It->IsChildOf(UPostRetargetActionBase::StaticClass()) && !It->HasAnyClassFlags(CLASS_Abstract))
 			{
-				{
-					FToolMenuEntry& Entry = Section.AddEntry(FToolMenuEntry::InitToolBarButton(
-						FAnimationExtractorCommands::Get().RetargetMissingAction,
-						TAttribute<FText>(),
-						TAttribute<FText>(),
-						FSlateIcon(
-							FAnimationExtractorStyle::GetStyleSetName(),
-							FName(TEXT("AnimationExtractor.Retarget")),
-							FName(TEXT("AnimationExtractor.Retarget.Small")))
-						));
-					Entry.SetCommandList(PluginCommands);
-				}
+				UPostRetargetActionBase* Action = NewObject<UPostRetargetActionBase>(GetTransientPackage(), *It);
+				checkf(Action != nullptr, TEXT("This can't fail considering how it's fetching the UClasses."));
+				PostRetargetActions.Add(TStrongObjectPtr<UPostRetargetActionBase>(Action));
 			}
 		}
+		PostRetargetActionsLoaded = true;
+	}
+
+	for (TStrongObjectPtr<UPostRetargetActionBase>& Action : PostRetargetActions)
+	{
+		Action->ExecuteAction(SourceSkeleton, SourceAsset, TargetSkeleton, RetargetedAsset);
 	}
 }
-
 
 #undef LOCTEXT_NAMESPACE
 
